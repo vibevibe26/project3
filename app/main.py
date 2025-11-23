@@ -10,7 +10,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.prebuilt import create_react_agent 
 from langgraph.checkpoint.memory import MemorySaver
 
-from total_tools import tool_search_ipc_code_with_description, tool_search_ipc_description_from_code,tool_search_patent
+from total_tools import tool_search_ipc_code_with_description, tool_search_ipc_description_from_code,tool_search_patent_with_description
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -35,7 +35,7 @@ SYSTEM_PROMPT = """
 # 2. 에이전트 생성 (메모리 장착!)
 # ==========================================
 
-tools = [tool_search_ipc_code_with_description, tool_search_ipc_description_from_code,tool_search_patent]
+tools = [tool_search_ipc_code_with_description, tool_search_ipc_description_from_code,tool_search_patent_with_description]
 llm = ChatOpenAI(model="gpt-5.1", temperature=0, api_key=OPENAI_API_KEY)
 
 # ★ 핵심 1: 메모리 저장소 초기화
