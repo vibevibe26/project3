@@ -29,10 +29,9 @@ class PatentSearchInput(BaseModel):
             "최종적으로 사용자에게 보여줄 특허 개수. "
             "사용자가 '상위 3개', '10개 정도'처럼 개수를 명시한 경우 그 값을 사용하고, "
             "언급이 없다면 기본값 5를 사용한다. "
-            "값이 클수록 더 많은 후보를 보여줄 수 있지만, 응답이 길어져 가독성이 떨어질 수 있다."
+            "값이 너무 크더라도 도구 내부에서 최대 30개까지만 사용하도록 자동으로 제한한다."
         ),
         ge=1,
-        le=30,  # 너무 크게 안 가져오도록 상한 설정
     )
     max_claims_per_patent: int = Field(
         3,
@@ -41,9 +40,9 @@ class PatentSearchInput(BaseModel):
             "patent_hybrid_search 함수의 max_claims_per_patent 인자에 매핑된다. "
             "각 특허에서 가장 유사한 청구항 몇 개만 보고 싶을 때 조절하는 파라미터로, "
             "일반적으로 1~3개면 충분하다."
+            "값이 너무 크더라도 도구 내부에서 최대 5개까지만 사용하도록 자동으로 제한한다."
         ),
         ge=1,
-        le=5,
     )
     exclude_patent_ids: List[str] = Field(
         default_factory=list,
@@ -131,6 +130,15 @@ class PatentSearchResult(BaseModel):
             "이 특허 안에서 유사도가 높은 상위 청구항 리스트. "
             "길이는 max_claims_per_patent 이하이며, "
             "대표 청구항(top_claim)도 이 리스트 안에 포함된다."
+        ),
+    )
+    result_index: int = Field(
+        ...,
+        description=(
+            "현재 응답에서 이 특허가 몇 번째 결과인지 나타내는 1부터 시작하는 번호. "
+            "예를 들어 첫번째 결과면 1, 두 번째 결과면 2. "
+            "벡터 DB 전체에서의 절대 등수가 아니라, "
+            "이번 tool 호출에서 반환된 결과 리스트 안에서의 위치를 의미한다."
         ),
     )
 
@@ -275,5 +283,87 @@ class IPCMainDescription(BaseModel):
         description=(
             "mains에서 선택된 main 코드들과 의미적으로 연관성이 높은 하위 IPC 코드들에 대한 정보. "
             "세부 분류까지 보고 싶을 때 참고용으로 함께 제시된다."
+        ),
+    )
+
+
+# ======================================
+# 3. 출원번호 기준으로 db 접근하기 위한 스키마
+# ======================================
+
+
+class PatentByIdInput(BaseModel):
+    """
+    출원번호(또는 patent_id)를 기반으로
+    해당 특허의 청구항들을 직접 조회할 때 사용하는 입력 스키마.
+    """
+    patent_id: str = Field(
+        ...,
+        description=(
+            "조회할 특허의 출원번호 또는 patent_id. "
+            "예: '1020230112930'. "
+            "벡터 검색이 아니라, 이 ID와 일치하는 문서들의 메타데이터를 "
+            "특허 청구항 벡터 DB에서 직접 조회할 때 사용한다."
+        ),
+    )
+    max_claims: int = Field(
+        0,
+        description=(
+            "가져올 청구항 개수 상한. "
+            "0인 경우에는 해당 특허의 모든 청구항을 가져온다. "
+            "너무 많은 청구항이 있을 수 있으므로, "
+            "간단히 확인할 경우에는 5~20 정도로 제한해서 사용할 수 있다."
+        ),
+        ge=0,
+        le=200,
+    )
+
+
+class PatentClaimFull(BaseModel):
+    """
+    출원번호로 조회했을 때, 개별 청구항의 전체 정보를 담는 스키마.
+    """
+    claim_no: int = Field(
+        ...,
+        description="청구항 번호 (메타데이터의 claim_no). 숫자로 정렬하여 출력한다.",
+    )
+    text: str = Field(
+        ...,
+        description="해당 청구항의 원문 텍스트 전체.",
+    )
+
+
+class PatentByIdOutput(BaseModel):
+    """
+    출원번호 기반 조회 툴의 최종 반환 결과.
+    """
+    patent_id: str = Field(
+        ...,
+        description="조회에 사용된 출원번호 또는 patent_id.",
+    )
+    found: bool = Field(
+        ...,
+        description=(
+            "True 이면 DB에서 해당 출원번호를 가진 청구항들이 하나 이상 발견되었음을 의미한다. "
+            "False 이면 현재 특허 벡터 DB 범위 안에 이 출원번호가 없다는 뜻이다."
+        ),
+    )
+    title: str = Field(
+        "",
+        description=(
+            "해당 특허의 발명의 명칭. "
+            "여러 청구항 메타데이터 중 첫 번째로 발견된 title 을 대표값으로 사용한다. "
+            "메타데이터에 title 정보가 없다면 빈 문자열일 수 있다."
+        ),
+    )
+    num_claims: int = Field(
+        ...,
+        description="DB에서 조회된 청구항 개수.",
+    )
+    claims: List[PatentClaimFull] = Field(
+        default_factory=list,
+        description=(
+            "청구항 번호(claim_no) 오름차순으로 정렬된 청구항 리스트. "
+            "max_claims 가 0이면 전체, 0보다 크면 그 개수만큼 앞에서 잘라서 반환한다."
         ),
     )

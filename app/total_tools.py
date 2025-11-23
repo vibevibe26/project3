@@ -15,7 +15,11 @@ from total_schemas import (
     PatentClaimSnippet,
     PatentSearchResult,
     PatentSearchOutput,
+    PatentByIdInput,       
+    PatentClaimFull,       
+    PatentByIdOutput,    
 )
+
 from ipc_func import get_ipc_detail_data_from_code, search_ipc_with_query
 from doc_func import patent_hybrid_search
 
@@ -52,6 +56,50 @@ doc_collection = doc_client.get_collection(name="patent_claims")
 # ---------------------------------------------------------
 # 1) 유사 특허 검색 툴
 # ---------------------------------------------------------
+
+# 특허 검색 파라미터 안전 범위
+MAX_TOP_K = 30               # DB에서 가져올 최대 특허 수
+MAX_CLAIMS_PER_PATENT = 5    # 특허당 최대 청구항 수
+EXTRA_MARGIN = 10            # 검색 풀 크기를 조절하기 위한 여유분
+
+
+# 재검색 안전장치 내부 helper 1
+def _normalize_top_k(raw_top_k: int | None) -> int:
+    """
+    top_k가 0이거나 너무 크더라도 안전한 범위 [1, MAX_TOP_K]로 잘라서 반환합니다.
+    """
+    if raw_top_k is None:
+        return 5
+    try:
+        value = int(raw_top_k)
+    except (TypeError, ValueError):
+        # 이상한 값이 들어오면 기본값
+        return 5
+
+    if value < 1:
+        return 1
+    if value > MAX_TOP_K:
+        return MAX_TOP_K
+    return value
+
+# 재검색 안전장치 내부 helper 2
+def _normalize_max_claims(raw_max_claims: int | None) -> int:
+    """
+    max_claims_per_patent를 [1, MAX_CLAIMS_PER_PATENT] 범위로 정규화합니다.
+    """
+    if raw_max_claims is None:
+        return 3
+    try:
+        value = int(raw_max_claims)
+    except (TypeError, ValueError):
+        return 3
+
+    if value < 1:
+        return 1
+    if value > MAX_CLAIMS_PER_PATENT:
+        return MAX_CLAIMS_PER_PATENT
+    return value
+
 
 @tool(args_schema=PatentSearchInput)
 def tool_search_patent_with_description(
@@ -92,11 +140,16 @@ def tool_search_patent_with_description(
         이전 턴에서 이미 보여준 특허를 다시 보여주지 않거나,
         사용자가 "2번/4번은 빼고 다시 찾아줘"라고 했을 때 활용합니다.
     """
+
     # None 방지
     exclude_patent_ids = exclude_patent_ids or []
+    safe_top_k = _normalize_top_k(top_k)
+    safe_max_claims = _normalize_max_claims(max_claims_per_patent)
+    search_pool_size = safe_top_k + len(exclude_patent_ids) + EXTRA_MARGIN
+    per_query_top_k = max(200, search_pool_size)
+    final_top_k = max(200, search_pool_size)
 
     # 1) 쿼리 리스트 구성
-    #    지금은 단일 쿼리만 사용하지만, 나중에 멀티쿼리(키워드 여러 개)로 확장 가능
     query_list = [query_text]
 
     # 2) hybrid search 함수 호출
@@ -104,10 +157,10 @@ def tool_search_patent_with_description(
         collection=doc_collection,
         model=doc_model,
         query_list=query_list,
-        per_query_top_k=200,
-        final_top_k=200,
+        per_query_top_k=per_query_top_k,
+        final_top_k=final_top_k,
         top_k=top_k * 2,  # 먼저 넉넉히 가져와서 나중에 exclude + top_k 적용
-        max_claims_per_patent=max_claims_per_patent,
+        max_claims_per_patent=safe_max_claims,
         vector_weight=0.7,
         bm25_weight=0.3,
     )
@@ -121,12 +174,12 @@ def tool_search_patent_with_description(
     ]
 
     # 4) 상위 top_k만 사용
-    filtered = filtered[:top_k]
+    filtered = filtered[:safe_top_k]
 
     # 5) raw dict → Pydantic 스키마로 매핑
     results: List[PatentSearchResult] = []
 
-    for item in filtered:
+    for idx, item in enumerate(filtered):
         claim_snippets: List[PatentClaimSnippet] = []
         for c in item.get("claims", []):
             claim_snippets.append(
@@ -139,13 +192,14 @@ def tool_search_patent_with_description(
                 )
             )
 
-        result_obj = PatentSearchResult(
+        result_obj = PatentSearchResult( 
             patent_id=item.get("patent_id", ""),
             score=float(item.get("score", 0.0)),
             top_claim=item.get("top_claim", ""),
             top_claim_no=int(item.get("top_claim_no", 0)),
             claims_found=int(item.get("claims_found", len(claim_snippets))),
             claims=claim_snippets,
+            result_index=idx+1
         )
         results.append(result_obj)
 
@@ -160,7 +214,121 @@ def tool_search_patent_with_description(
 
 
 # ---------------------------------------------------------
-# 2) 기술 설명 → IPC 추천 툴
+# 2) 출원번호로 특허 검색하기 위한 툴
+# ---------------------------------------------------------
+
+@tool(args_schema=PatentByIdInput)
+def tool_get_patent_by_id(
+    patent_id: str,
+    max_claims: int = 0,
+) -> PatentByIdOutput:
+    """
+    출원번호(또는 patent_id)를 기반으로, 특허 청구항 벡터 DB에서
+    해당 특허에 속한 청구항들을 **직접 조회**하는 툴입니다.
+
+    이 툴을 호출해야 하는 상황 (LLM용 가이드):
+    - 사용자가
+      - "출원번호 1020230112930에 대해서 DB에서 자료 끌어와서 알려줘"
+      - "이 출원번호 특허의 청구항들을 보여줘"
+      - "위에서 말한 특허 1020...의 청구항 전체를 보고 싶어"
+      와 같이 **특정 출원번호 하나를 정확히 지정**하고,
+      그 내용(특히 청구항)을 확인하고자 할 때 사용하세요.
+
+    주의 사항:
+    - 이 DB는 '컴퓨터 비전/모빌리티' 등 특정 도메인에 한정된 서브셋일 수 있습니다.
+      따라서, 출원번호가 실제로 존재하더라도, 이 벡터 DB 안에 없을 수 있습니다.
+      그런 경우에는 found=False와 함께, KIPRIS/특허로 등 외부 서비스를 안내해야 합니다.
+    """
+    # 1) 입력 출원번호 정규화 (공백 제거 등)
+    normalized_id = patent_id.strip()
+
+    if not normalized_id:
+        # 비어있는 입력이 들어오는 경우 방어 코드
+        return PatentByIdOutput(
+            patent_id=patent_id,
+            found=False,
+            title="",
+            num_claims=0,
+            claims=[],
+        )
+
+    # 2) Chroma get() + where 필터로 메타데이터 기반 조회
+    raw = doc_collection.get(
+        where={"patent_id": normalized_id},
+        include=["metadatas", "documents"],
+    )
+
+    ids = raw.get("ids", [])
+    docs = raw.get("documents", [])
+    metas = raw.get("metadatas", [])
+
+    if not ids:
+        # 이 DB 범위 안에 해당 출원번호가 없는 경우
+        return PatentByIdOutput(
+            patent_id=normalized_id,
+            found=False,
+            title="",
+            num_claims=0,
+            claims=[],
+        )
+
+    # 3) 메타데이터에서 claim_no, title 추출해서 정리
+    claim_items = []
+    title_candidates = []
+
+    for doc_text, meta in zip(docs, metas):
+        # claim_no 파싱 (없거나 형식 이상하면 큰 숫자로 처리해서 뒤로 밀기)
+        raw_claim_no = meta.get("claim_no", None)
+        try:
+            claim_no = int(raw_claim_no)
+        except (TypeError, ValueError):
+            claim_no = 999999
+
+        # title 후보 수집
+        title = meta.get("title", "")
+        if title:
+            title_candidates.append(title)
+
+        claim_items.append(
+            {
+                "claim_no": claim_no,
+                "text": doc_text or "",
+            }
+        )
+
+    # 4) claim_no 기준으로 정렬
+    claim_items_sorted = sorted(
+        claim_items,
+        key=lambda x: x["claim_no"],
+    )
+
+    # 5) max_claims 적용 (0이면 전체)
+    if max_claims > 0:
+        claim_items_sorted = claim_items_sorted[:max_claims]
+
+    # 6) Pydantic 모델로 변환
+    claim_models: List[PatentClaimFull] = [
+        PatentClaimFull(
+            claim_no=item["claim_no"],
+            text=item["text"],
+        )
+        for item in claim_items_sorted
+    ]
+
+    # 대표 title 선택 (가장 처음 발견된 비어있지 않은 title)
+    title_value = title_candidates[0] if title_candidates else ""
+
+    return PatentByIdOutput(
+        patent_id=normalized_id,
+        found=True,
+        title=title_value,
+        num_claims=len(claim_models),
+        claims=claim_models,
+    )
+
+
+# ---------------------------------------------------------
+# 3) 기술 설명 → IPC 추천 툴
 # ---------------------------------------------------------
 
 @tool(args_schema=IPCKeywordInput)
@@ -208,7 +376,7 @@ def tool_search_ipc_code_with_description(
 
 
 # ---------------------------------------------------------
-# 3) IPC 코드 → 상세 설명 툴
+# 4) IPC 코드 → 상세 설명 툴
 # ---------------------------------------------------------
 
 @tool(args_schema=IPCCodeInput)
